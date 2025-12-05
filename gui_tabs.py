@@ -28,6 +28,40 @@ def _win_send_mouse_move(dx, dy):
         return True
     except Exception:
         return False
+
+def _get_pixel_color(x, y):
+    """Return (r,g,b) for screen pixel at (x,y) on Windows using GDI GetPixel."""
+    try:
+        user32 = ctypes.windll.user32
+        gdi32 = ctypes.windll.gdi32
+        hdc = user32.GetDC(0)
+        pixel = gdi32.GetPixel(hdc, int(x), int(y))
+        user32.ReleaseDC(0, hdc)
+        if pixel == -1:
+            return None
+        # pixel is a COLORREF (0x00bbggrr)
+        r = pixel & 0x0000ff
+        g = (pixel & 0x00ff00) >> 8
+        b = (pixel & 0xff0000) >> 16
+        try:
+            logging.getLogger(__name__).debug("GetPixel at (%s,%s) -> raw=0x%08x r=%d g=%d b=%d", x, y, pixel, r, g, b)
+        except Exception:
+            pass
+        return (r, g, b)
+    except Exception:
+        return None
+
+def _get_cursor_pos():
+    """Return current cursor position as (x,y) using Win32 GetCursorPos (avoids scaling mismatch)."""
+    try:
+        class POINT(ctypes.Structure):
+            _fields_ = [("x", wintypes.LONG), ("y", wintypes.LONG)]
+        pt = POINT()
+        if ctypes.windll.user32.GetCursorPos(ctypes.byref(pt)):
+            return (pt.x, pt.y)
+        return None
+    except Exception:
+        return None
 import logging
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -55,9 +89,32 @@ class TabbedGUI:
         # --- Hotkey and Button Variables ---
         self.current_button = tk.StringVar(value="left")
         self.current_hotkey = tk.StringVar(value="f6")
+        # Autoclicker keyboard substitution
+        self.autoclick_use_keyboard_var = tk.IntVar(value=0)
+        self.autoclick_key_var = tk.StringVar(value='')
         # Macro hotkeys
         self.macro_start_hotkey = tk.StringVar(value="f7")
         self.macro_stop_hotkey = tk.StringVar(value="f8")
+        # Reaction Test hotkeys and settings
+        self.reaction_start_hotkey = tk.StringVar(value="f9")
+        self.reaction_stop_hotkey = tk.StringVar(value="f10")
+        self.reaction_x_var = tk.StringVar(value="0")
+        self.reaction_y_var = tk.StringVar(value="0")
+        self.reaction_color_var = tk.StringVar(value="#000000")
+        self.reaction_color_name_var = tk.StringVar(value='Green')
+        self.reaction_use_exact_var = tk.IntVar(value=0)
+        self.reaction_custom_hex = tk.StringVar(value='#00b962')
+        self.reaction_tolerance_var = tk.IntVar(value=20)
+        self.reaction_delay_var = tk.StringVar(value="0")
+        self.reaction_cooldown_var = tk.StringVar(value="200")
+        self.reaction_button = tk.StringVar(value="left")
+        # Whether the reaction watcher should follow the current cursor position
+        self.reaction_watch_cursor_var = tk.IntVar(value=0)
+        # Reaction test keyboard substitution
+        self.reaction_use_keyboard_var = tk.IntVar(value=0)
+        self.reaction_key_var = tk.StringVar(value='')
+        self._reaction_thread = None
+        self._reaction_running = False
         self.is_setting_hotkey = False
         self.keyboard_listener = None
         
@@ -82,6 +139,8 @@ class TabbedGUI:
         self.timing_strategy_var = tk.StringVar(value='after')
         # Logging level selection
         self.logging_level_var = tk.StringVar(value='DEBUG')
+        # Dark mode toggle
+        self.dark_mode_var = tk.IntVar(value=0)
         # Window behavior options
         self.always_on_top_var = tk.IntVar(value=1)
         self.toolwindow_var = tk.IntVar(value=0)
@@ -139,14 +198,25 @@ class TabbedGUI:
 
         self.create_autoclicker_tab()
         self.create_macro_tab()
+        self.create_reaction_tab()
         self.create_settings_tab()
-        
+        # Apply theme (dark mode) to canvases and styles based on setting
+        try:
+            self._apply_dark_mode()
+        except Exception:
+            pass
         # Start the keyboard listener immediately
         try:
             self._start_hotkey_listener()
             self.logger.info("Hotkey listener started")
         except Exception as e:
             self.logger.exception("Failed to start hotkey listener: %s", e)
+        # Try to make the process DPI aware so GetCursorPos/GetPixel map to physical pixels
+        try:
+            if hasattr(ctypes.windll.user32, 'SetProcessDPIAware'):
+                ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
 
     # --- GUI Setup Methods ---
     
@@ -161,6 +231,8 @@ class TabbedGUI:
         
         # Create Canvas and Scrollbar for scrolling content
         canvas = tk.Canvas(tab_frame, highlightthickness=0, bg="white")
+        # expose for theming
+        self.autoclicker_canvas = canvas
         scrollbar = ttk.Scrollbar(tab_frame, orient='vertical', command=canvas.yview)
         scrollable_frame = ttk.Frame(canvas)
         
@@ -175,10 +247,11 @@ class TabbedGUI:
         canvas.pack(side='left', fill='both', expand=True)
         scrollbar.pack(side='right', fill='y')
         
-        # Enable mousewheel scrolling
+        # Enable mousewheel scrolling only when cursor is over this canvas
         def _on_mousewheel(event):
             canvas.yview_scroll(int(-1*(event.delta/120)), "units")
-        canvas.bind_all("<MouseWheel>", _on_mousewheel)
+        canvas.bind("<Enter>", lambda e: canvas.bind_all("<MouseWheel>", _on_mousewheel))
+        canvas.bind("<Leave>", lambda e: canvas.unbind_all("<MouseWheel>"))
         
         self.autoclicker_frame = scrollable_frame
         self.autoclicker_frame.padding = "20"
@@ -249,6 +322,15 @@ class TabbedGUI:
         # Reset stats button on the same logical group
         self.reset_stats_button = ttk.Button(self.autoclicker_frame, text="Reset Stats", command=self.reset_stats)
         self.reset_stats_button.grid(row=r, column=2, padx=5, pady=5, sticky='e')
+        r += 1
+
+        # Keyboard substitution: allow sending a keyboard key instead of/more than mouse click
+        ttk.Checkbutton(self.autoclicker_frame, text='Use Keyboard Keys', variable=self.autoclick_use_keyboard_var).grid(row=r, column=0, sticky='w')
+        kb_frame = ttk.Frame(self.autoclicker_frame)
+        kb_frame.grid(row=r, column=1, columnspan=2, sticky='w')
+        self.autoclick_key_label = ttk.Label(kb_frame, text=self.autoclick_key_var.get() or 'None', foreground='blue')
+        self.autoclick_key_label.pack(side='left', padx=(0,6))
+        ttk.Button(kb_frame, text='Set Key', command=self._bind_autoclick_key).pack(side='left')
         r += 1
 
     def _on_button_changed(self, event):
@@ -331,6 +413,8 @@ class TabbedGUI:
         
         # Create Canvas and Scrollbar for scrolling content
         canvas = tk.Canvas(tab_frame, highlightthickness=0, bg="white")
+        # expose for theming
+        self.settings_canvas = canvas
         scrollbar = ttk.Scrollbar(tab_frame, orient='vertical', command=canvas.yview)
         scrollable_frame = ttk.Frame(canvas)
         
@@ -345,10 +429,11 @@ class TabbedGUI:
         canvas.pack(side='left', fill='both', expand=True)
         scrollbar.pack(side='right', fill='y')
         
-        # Enable mousewheel scrolling
+        # Enable mousewheel scrolling only when cursor is over this canvas
         def _on_mousewheel(event):
             canvas.yview_scroll(int(-1*(event.delta/120)), "units")
-        canvas.bind_all("<MouseWheel>", _on_mousewheel)
+        canvas.bind("<Enter>", lambda e: canvas.bind_all("<MouseWheel>", _on_mousewheel))
+        canvas.bind("<Leave>", lambda e: canvas.unbind_all("<MouseWheel>"))
         
         self.settings_frame = scrollable_frame
         
@@ -381,6 +466,8 @@ class TabbedGUI:
         self.logging_combo = ttk.Combobox(log_frame, textvariable=self.logging_level_var,
                           values=("DEBUG", "INFO", "WARNING", "ERROR"), state='readonly', width=10)
         self.logging_combo.pack(side='left')
+        # Dark mode toggle
+        ttk.Checkbutton(self.settings_frame, text='Dark Mode', variable=self.dark_mode_var, command=self._apply_dark_mode).pack(anchor='w', padx=10, pady=(8,2))
 
         # Macro hotkey bindings
         ttk.Label(self.settings_frame, text="Macro Hotkeys:").pack(anchor='w', padx=10, pady=(10,2))
@@ -455,6 +542,9 @@ class TabbedGUI:
                 # Macro start/stop handling
                 macro_start = (self.macro_start_hotkey.get() or 'f7').lower()
                 macro_stop = (self.macro_stop_hotkey.get() or 'f8').lower()
+                # Reaction test start/stop handling
+                reaction_start = (self.reaction_start_hotkey.get() or 'f9').lower()
+                reaction_stop = (self.reaction_stop_hotkey.get() or 'f10').lower()
                 if key_name == macro_start:
                     self._hotkey_last_time = now
                     if not getattr(self, '_macro_playing', False):
@@ -465,6 +555,24 @@ class TabbedGUI:
                             # start macro playback
                             self.play_macro(name)
                             self.logger.info(f"Macro start hotkey pressed: starting macro '{name}'")
+                    return
+                if key_name == reaction_start:
+                    self._hotkey_last_time = now
+                    try:
+                        if not getattr(self, '_reaction_running', False):
+                            self.start_reaction_test()
+                            self.logger.info(f"Reaction test start hotkey pressed: starting")
+                    except Exception:
+                        pass
+                    return
+                if key_name == reaction_stop:
+                    self._hotkey_last_time = now
+                    try:
+                        if getattr(self, '_reaction_running', False):
+                            self.stop_reaction_test()
+                            self.logger.info("Reaction test stop hotkey pressed: stopping")
+                    except Exception:
+                        pass
                     return
                 if key_name == macro_stop:
                     self._hotkey_last_time = now
@@ -760,16 +868,47 @@ class TabbedGUI:
                 # Press
                 if self.click_count < 3:
                     self.logger.info("Worker click %d: btn=%s dur=%.3f int=%.3f", self.click_count+1, btn_name, duration, interval)
-                self.mouse.press(btn)
+                # If configured, send a keyboard key instead of mouse click
+                use_kb = getattr(self, 'autoclick_use_keyboard_var', None) and self.autoclick_use_keyboard_var.get()
+                kb_key = (self.autoclick_key_var.get() or '').strip() if use_kb else ''
+                if use_kb and kb_key:
+                    try:
+                        from pynput.keyboard import Controller as KController, Key
+                        kctl = KController()
+                        if hasattr(Key, kb_key):
+                            kctl.press(getattr(Key, kb_key))
+                        else:
+                            kctl.press(kb_key)
+                    except Exception:
+                        try:
+                            kctl.press(kb_key)
+                        except Exception:
+                            pass
+                else:
+                    self.mouse.press(btn)
 
                 # Wait for duration or until stop
                 self.stop_event.wait(duration)
 
-                # Release
-                try:
-                    self.mouse.release(btn)
-                except Exception:
-                    pass
+                # Release (keyboard or mouse)
+                if use_kb and kb_key:
+                    try:
+                        from pynput.keyboard import Controller as KController, Key
+                        kctl = KController()
+                        if hasattr(Key, kb_key):
+                            kctl.release(getattr(Key, kb_key))
+                        else:
+                            kctl.release(kb_key)
+                    except Exception:
+                        try:
+                            kctl.release(kb_key)
+                        except Exception:
+                            pass
+                else:
+                    try:
+                        self.mouse.release(btn)
+                    except Exception:
+                        pass
 
                 self.click_count += 1
 
@@ -870,18 +1009,53 @@ class TabbedGUI:
             # Perform the click
             if duration > 0:
                 # Manual press/release with duration
-                self.mouse.press(btn)
+                use_kb = getattr(self, 'autoclick_use_keyboard_var', None) and self.autoclick_use_keyboard_var.get()
+                kb_key = (self.autoclick_key_var.get() or '').strip() if use_kb else ''
+                if use_kb and kb_key:
+                    try:
+                        from pynput.keyboard import Controller as KController, Key
+                        kctl = KController()
+                        if hasattr(Key, kb_key):
+                            kctl.press(getattr(Key, kb_key))
+                        else:
+                            kctl.press(kb_key)
+                    except Exception:
+                        try:
+                            kctl.press(kb_key)
+                        except Exception:
+                            pass
+                else:
+                    self.mouse.press(btn)
                 if self.click_count < 3:
                     self.logger.debug("After-mode press: btn=%s count=%d interval=%.3fs duration=%.3fs", btn_name, self.click_count + 1, interval, duration)
-                
                 duration_ms = int(round(duration * 1000))
                 self._after_id = self.master.after(duration_ms, lambda b=btn, i=interval: self._after_release_and_schedule(b, i))
             else:
-                # Instant click using click() method
-                self.mouse.click(btn)
-                self.click_count += 1
-                if self.click_count < 3:
-                    self.logger.debug("After-mode instant click: btn=%s count=%d interval=%.3fs", btn_name, self.click_count, interval)
+                # Instant click using click() method or keyboard substitute
+                use_kb = getattr(self, 'autoclick_use_keyboard_var', None) and self.autoclick_use_keyboard_var.get()
+                kb_key = (self.autoclick_key_var.get() or '').strip() if use_kb else ''
+                if use_kb and kb_key:
+                    try:
+                        from pynput.keyboard import Controller as KController, Key
+                        kctl = KController()
+                        if hasattr(Key, kb_key):
+                            kctl.press(getattr(Key, kb_key))
+                            kctl.release(getattr(Key, kb_key))
+                        else:
+                            kctl.press(kb_key)
+                            kctl.release(kb_key)
+                    except Exception:
+                        try:
+                            kctl.press(kb_key); kctl.release(kb_key)
+                        except Exception:
+                            pass
+                    self.click_count += 1
+                else:
+                    # Mouse instant click
+                    self.mouse.click(btn)
+                    self.click_count += 1
+                    if self.click_count < 3:
+                        self.logger.debug("After-mode instant click: btn=%s count=%d interval=%.3fs", btn_name, self.click_count, interval)
                 
                 # Update status
                 try:
@@ -912,8 +1086,24 @@ class TabbedGUI:
     def _after_release_and_schedule(self, btn, interval):
         """Release button and schedule next click after interval."""
         try:
-            # Release
-            self.mouse.release(btn)
+            # Release (mouse or keyboard substitution)
+            use_kb = getattr(self, 'autoclick_use_keyboard_var', None) and self.autoclick_use_keyboard_var.get()
+            kb_key = (self.autoclick_key_var.get() or '').strip() if use_kb else ''
+            if use_kb and kb_key:
+                try:
+                    from pynput.keyboard import Controller as KController, Key
+                    kctl = KController()
+                    if hasattr(Key, kb_key):
+                        kctl.release(getattr(Key, kb_key))
+                    else:
+                        kctl.release(kb_key)
+                except Exception:
+                    try:
+                        kctl.release(kb_key)
+                    except Exception:
+                        pass
+            else:
+                self.mouse.release(btn)
             self.click_count += 1
             self.logger.debug("After-mode release: count=%d", self.click_count)
 
@@ -984,6 +1174,76 @@ class TabbedGUI:
         except Exception:
             pass
 
+    def _apply_dark_mode(self):
+        """Apply a simple dark/light theme across the app."""
+        try:
+            enabled = bool(self.dark_mode_var.get())
+            style = ttk.Style()
+            try:
+                style.theme_use('clam')
+            except Exception:
+                pass
+            if enabled:
+                # Dark mode: dark background, white text, gray fields
+                bg = '#2b2b2b'
+                fg = '#ffffff'
+                field = '#454545'
+                field_fg = '#ffffff'
+                active_bg = '#505357'
+                tab_bg = '#1e1e1e'
+            else:
+                # Light mode: white background, black text, white fields
+                bg = 'white'
+                fg = 'black'
+                field = 'white'
+                field_fg = 'black'
+                active_bg = '#e6e6e6'
+                tab_bg = 'white'
+            # Generic styling
+            style.configure('.', background=bg, foreground=fg)
+            style.configure('TLabel', background=bg, foreground=fg)
+            style.configure('TFrame', background=bg, foreground=fg)
+            style.configure('TButton', background=field, foreground=field_fg)
+            style.configure('TEntry', fieldbackground=field, foreground=field_fg, background=bg)
+            style.configure('TCombobox', fieldbackground=field, foreground=field_fg, background=bg)
+            style.configure('TCheckbutton', background=bg, foreground=fg)
+            style.configure('TScale', background=bg)
+            style.configure('TListbox', background=field, foreground=field_fg)
+            # Configure notebook tabs with darker background for selected tab
+            style.configure('TNotebook', background=bg, borderwidth=0)
+            style.configure('TNotebook.Tab', background=field, foreground=field_fg, padding=[10, 5])
+            style.map('TNotebook.Tab', background=[('selected', tab_bg)], foreground=[('selected', fg)])
+            style.map('TButton', background=[('active', active_bg)])
+            style.map('TEntry', fieldbackground=[('readonly', field)])
+            style.map('TCombobox', fieldbackground=[('readonly', field)])
+            # Update canvas and frame backgrounds if available
+            for attr in ('autoclicker_canvas', 'macro_canvas', 'reaction_canvas', 'settings_canvas'):
+                try:
+                    c = getattr(self, attr, None)
+                    if c:
+                        c.configure(bg=bg)
+                except Exception:
+                    pass
+            # Update scrollable frames (which are nested in canvases)
+            for attr in ('autoclicker_frame', 'macro_frame', 'reaction_frame', 'settings_frame'):
+                try:
+                    f = getattr(self, attr, None)
+                    if f:
+                        f.configure(background=bg)
+                except Exception:
+                    pass
+            try:
+                self.master.configure(bg=bg)
+            except Exception:
+                pass
+            # Update top bar
+            try:
+                self.top_bar.configure(background=bg)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
     def create_macro_tab(self):
         """Creates and populates the 'Macro Tab' for recording and running macros with scrolling support."""
         # Create main frame for the tab
@@ -992,6 +1252,8 @@ class TabbedGUI:
         
         # Create Canvas and Scrollbar for scrolling content
         canvas = tk.Canvas(tab_frame, highlightthickness=0, bg="white")
+        # expose for theming
+        self.macro_canvas = canvas
         scrollbar = ttk.Scrollbar(tab_frame, orient='vertical', command=canvas.yview)
         scrollable_frame = ttk.Frame(canvas)
         
@@ -1006,10 +1268,11 @@ class TabbedGUI:
         canvas.pack(side='left', fill='both', expand=True)
         scrollbar.pack(side='right', fill='y')
         
-        # Enable mousewheel scrolling
+        # Enable mousewheel scrolling only when cursor is over this canvas
         def _on_mousewheel(event):
             canvas.yview_scroll(int(-1*(event.delta/120)), "units")
-        canvas.bind_all("<MouseWheel>", _on_mousewheel)
+        canvas.bind("<Enter>", lambda e: canvas.bind_all("<MouseWheel>", _on_mousewheel))
+        canvas.bind("<Leave>", lambda e: canvas.unbind_all("<MouseWheel>"))
         
         self.macro_frame = scrollable_frame
 
@@ -1041,6 +1304,164 @@ class TabbedGUI:
         self.macros = {}  # name -> {events: [...], looped: bool}
         self.current_macro = []
         self.selected_macro_name = None
+
+    def create_reaction_tab(self):
+        """Create the Reaction Test Tab: choose pixel, color, tolerance, delays, and keybinds."""
+        tab_frame = ttk.Frame(self.notebook)
+        self.notebook.add(tab_frame, text='Reaction Test')
+
+        canvas = tk.Canvas(tab_frame, highlightthickness=0, bg='white')
+        # expose for theming
+        self.reaction_canvas = canvas
+        scrollbar = ttk.Scrollbar(tab_frame, orient='vertical', command=canvas.yview)
+        scrollable_frame = ttk.Frame(canvas)
+
+        scrollable_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+
+        canvas.create_window((0, 0), window=scrollable_frame, anchor='nw')
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side='left', fill='both', expand=True)
+        scrollbar.pack(side='right', fill='y')
+
+        # Enable mousewheel scrolling only when cursor over this canvas
+        def _on_mousewheel(event):
+            canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+        canvas.bind("<Enter>", lambda e: canvas.bind_all("<MouseWheel>", _on_mousewheel))
+        canvas.bind("<Leave>", lambda e: canvas.unbind_all("<MouseWheel>"))
+
+        self.reaction_frame = scrollable_frame
+
+        # Location controls
+        loc_frame = ttk.Frame(self.reaction_frame)
+        loc_frame.pack(fill='x', padx=10, pady=6)
+        ttk.Label(loc_frame, text='Watch X:').grid(row=0, column=0, sticky='w')
+        ttk.Entry(loc_frame, textvariable=self.reaction_x_var, width=8).grid(row=0, column=1, padx=4)
+        ttk.Label(loc_frame, text='Y:').grid(row=0, column=2, sticky='w')
+        ttk.Entry(loc_frame, textvariable=self.reaction_y_var, width=8).grid(row=0, column=3, padx=4)
+        ttk.Button(loc_frame, text='Sample Cursor', command=self._sample_pixel_at_cursor).grid(row=0, column=4, padx=6)
+        # Watch Cursor toggle: when enabled, the reaction loop will sample the current cursor position
+        ttk.Checkbutton(loc_frame, text='Watch Cursor', variable=self.reaction_watch_cursor_var).grid(row=0, column=5, padx=6)
+
+        # Color and tolerance
+        color_frame = ttk.Frame(self.reaction_frame)
+        color_frame.pack(fill='x', padx=10, pady=6)
+        ttk.Label(color_frame, text='Target Color:').grid(row=0, column=0, sticky='w')
+        self.color_preview = ttk.Label(color_frame, text='      ', background=self.reaction_color_var.get())
+        self.color_preview.grid(row=0, column=1, padx=6)
+        # Base color selection (friendly names)
+        base_colors = ('Green','Red','Blue','Purple','Yellow','Orange','Black','White')
+        self.color_combo = ttk.Combobox(color_frame, textvariable=self.reaction_color_name_var, values=base_colors, state='readonly', width=12)
+        self.color_combo.grid(row=0, column=2, padx=4)
+        ttk.Button(color_frame, text='Sample Color', command=self._sample_color_at_coords).grid(row=0, column=3, padx=6)
+
+        # Exact color toggle and hex entry
+        self.exact_cb = ttk.Checkbutton(color_frame, text='Use Exact Color', variable=self.reaction_use_exact_var)
+        self.exact_cb.grid(row=1, column=0, sticky='w', pady=6)
+        ttk.Entry(color_frame, textvariable=self.reaction_custom_hex, width=12).grid(row=1, column=1, padx=4)
+
+        ttk.Label(color_frame, text='Tolerance:').grid(row=2, column=0, sticky='w', pady=6)
+        ttk.Scale(color_frame, from_=0, to=255, orient='horizontal', variable=self.reaction_tolerance_var).grid(row=2, column=1, columnspan=3, sticky='we', padx=4)
+
+        # Action options
+        action_frame = ttk.Frame(self.reaction_frame)
+        action_frame.pack(fill='x', padx=10, pady=6)
+        ttk.Label(action_frame, text='Delay (ms):').grid(row=0, column=0, sticky='w')
+        ttk.Entry(action_frame, textvariable=self.reaction_delay_var, width=8).grid(row=0, column=1, padx=4)
+        ttk.Label(action_frame, text='Cooldown (ms):').grid(row=0, column=2, sticky='w')
+        ttk.Entry(action_frame, textvariable=self.reaction_cooldown_var, width=8).grid(row=0, column=3, padx=4)
+        ttk.Label(action_frame, text='Button:').grid(row=1, column=0, sticky='w', pady=6)
+        ttk.Combobox(action_frame, textvariable=self.reaction_button, values=('left','right','middle'), state='readonly', width=8).grid(row=1, column=1, padx=4)
+        # Reaction keyboard substitution controls
+        ttk.Checkbutton(action_frame, text='Use Keyboard Keys', variable=self.reaction_use_keyboard_var).grid(row=2, column=0, sticky='w', pady=6)
+        kb2 = ttk.Frame(action_frame)
+        kb2.grid(row=2, column=1, columnspan=3, sticky='w')
+        self.reaction_key_label = ttk.Label(kb2, text=self.reaction_key_var.get() or 'None', foreground='blue')
+        self.reaction_key_label.pack(side='left', padx=(0,6))
+        ttk.Button(kb2, text='Set Key', command=self._bind_reaction_key).pack(side='left')
+
+        # Start/Stop and keybinds
+        ctrl_frame = ttk.Frame(self.reaction_frame)
+        ctrl_frame.pack(fill='x', padx=10, pady=8)
+        # Top row: Start / Stop buttons
+        btn_row = ttk.Frame(ctrl_frame)
+        btn_row.pack(fill='x')
+        self.reaction_start_btn = ttk.Button(btn_row, text='Start', command=self.start_reaction_test)
+        self.reaction_start_btn.pack(side='left', padx=6)
+        self.reaction_stop_btn = ttk.Button(btn_row, text='Stop', command=self.stop_reaction_test, state='disabled')
+        self.reaction_stop_btn.pack(side='left', padx=6)
+
+        # Bottom row: hotkey controls placed under Start and Stop respectively
+        hk_row = ttk.Frame(ctrl_frame)
+        hk_row.pack(fill='x', pady=(6,0))
+        # Left column: Start hotkey
+        hk_left = ttk.Frame(hk_row)
+        hk_left.pack(side='left', anchor='nw')
+        ttk.Label(hk_left, text='Start Hotkey:').pack(anchor='w')
+        hk_start_sub = ttk.Frame(hk_left)
+        hk_start_sub.pack(anchor='w', pady=2)
+        self.reaction_start_label = ttk.Label(hk_start_sub, text=self.reaction_start_hotkey.get(), foreground='blue')
+        self.reaction_start_label.pack(side='left', padx=(0,6))
+        ttk.Button(hk_start_sub, text='Set', command=self._bind_reaction_start_hotkey).pack(side='left')
+
+        # Right column: Stop hotkey
+        hk_right = ttk.Frame(hk_row)
+        hk_right.pack(side='left', anchor='nw', padx=40)
+        ttk.Label(hk_right, text='Stop Hotkey:').pack(anchor='w')
+        hk_stop_sub = ttk.Frame(hk_right)
+        hk_stop_sub.pack(anchor='w', pady=2)
+        self.reaction_stop_label = ttk.Label(hk_stop_sub, text=self.reaction_stop_hotkey.get(), foreground='blue')
+        self.reaction_stop_label.pack(side='left', padx=(0,6))
+        ttk.Button(hk_stop_sub, text='Set', command=self._bind_reaction_stop_hotkey).pack(side='left')
+
+        # Update color preview when var changes
+        # Map base color names to hex values
+        self._base_color_map = {
+            'Green': '#00ff00',
+            'Red': '#ff0000',
+            'Blue': '#0000ff',
+            'Purple': '#800080',
+            'Yellow': '#ffff00',
+            'Orange': '#ffa500',
+            'Black': '#000000',
+            'White': '#ffffff',
+        }
+
+        def _update_preview(*a):
+            try:
+                # If using exact/custom mode, use that hex, otherwise map from selected base name
+                if self.reaction_use_exact_var.get():
+                    hexv = self.reaction_custom_hex.get() or '#000000'
+                else:
+                    name = self.reaction_color_name_var.get()
+                    hexv = self._base_color_map.get(name, '#000000')
+                # ensure valid format
+                if not hexv.startswith('#'):
+                    hexv = '#' + hexv
+                self.reaction_color_var.set(hexv)
+                self.color_preview.config(background=hexv)
+            except Exception:
+                pass
+
+        try:
+            # Watch both name changes and exact-hex changes
+            self.reaction_color_name_var.trace_add('write', lambda *args: _update_preview())
+            self.reaction_use_exact_var.trace_add('write', lambda *args: _update_preview())
+            self.reaction_custom_hex.trace_add('write', lambda *args: _update_preview())
+        except Exception:
+            try:
+                self.reaction_color_name_var.trace('w', lambda *args: _update_preview())
+                self.reaction_use_exact_var.trace('w', lambda *args: _update_preview())
+                self.reaction_custom_hex.trace('w', lambda *args: _update_preview())
+            except Exception:
+                pass
+        # initialize preview
+        try:
+            _update_preview()
+        except Exception:
+            pass
 
     def delete_macro(self):
         selection = self.macro_listbox.curselection()
@@ -1264,6 +1685,290 @@ class TabbedGUI:
             self._macro_playing = False
         except Exception:
             pass
+
+    def _sample_pixel_at_cursor(self):
+        """Sample current cursor position and set X,Y and color fields."""
+        try:
+            pos = _get_cursor_pos()
+            if pos:
+                x, y = pos
+            else:
+                # fallback to pynput if GetCursorPos failed
+                x, y = self.mouse.position
+            self.reaction_x_var.set(str(int(x)))
+            self.reaction_y_var.set(str(int(y)))
+            col = _get_pixel_color(int(x), int(y))
+            if col:
+                # ensure we always use #rrggbb format
+                self.reaction_color_var.set('#%02x%02x%02x' % (col[0], col[1], col[2]))
+        except Exception:
+            pass
+
+    def _sample_color_at_coords(self):
+        try:
+            x = int(self.reaction_x_var.get())
+            y = int(self.reaction_y_var.get())
+            col = _get_pixel_color(x, y)
+            if col:
+                # If exact mode enabled, set custom hex to sampled color
+                if self.reaction_use_exact_var.get():
+                    self.reaction_custom_hex.set('#%02x%02x%02x' % (col[0], col[1], col[2]))
+                else:
+                    # find nearest base color by Euclidean distance
+                    best_name = None
+                    best_dist = None
+                    for name, hexv in getattr(self, '_base_color_map', {}).items():
+                        r = int(hexv[1:3], 16)
+                        g = int(hexv[3:5], 16)
+                        b = int(hexv[5:7], 16)
+                        dist = ((r-col[0])**2 + (g-col[1])**2 + (b-col[2])**2) ** 0.5
+                        if best_dist is None or dist < best_dist:
+                            best_dist = dist
+                            best_name = name
+                    if best_name:
+                        self.reaction_color_name_var.set(best_name)
+        except Exception:
+            pass
+
+    def start_reaction_test(self):
+        if getattr(self, '_reaction_running', False):
+            return
+        self._reaction_running = True
+        self.reaction_start_btn.config(state='disabled')
+        self.reaction_stop_btn.config(state='normal')
+        self._reaction_thread = threading.Thread(target=self._reaction_loop, daemon=True)
+        self._reaction_thread.start()
+
+    def stop_reaction_test(self):
+        try:
+            self._reaction_running = False
+        except Exception:
+            pass
+        try:
+            self.reaction_start_btn.config(state='normal')
+            self.reaction_stop_btn.config(state='disabled')
+        except Exception:
+            pass
+
+    def _color_distance(self, a, b):
+        return ((a[0]-b[0])**2 + (a[1]-b[1])**2 + (a[2]-b[2])**2) ** 0.5
+
+    def _reaction_loop(self):
+        mouse = Controller()
+        btn_name = (self.reaction_button.get() or 'left').lower()
+        if btn_name == 'right':
+            btn = Button.right
+        elif btn_name == 'middle':
+            btn = Button.middle
+        else:
+            btn = Button.left
+
+        try:
+            # Determine target RGB depending on exact mode or base color
+            if self.reaction_use_exact_var.get():
+                target_hex = self.reaction_custom_hex.get()
+            else:
+                name = self.reaction_color_name_var.get()
+                target_hex = self._base_color_map.get(name, '#000000')
+            if target_hex and target_hex.startswith('#'):
+                target_rgb = tuple(int(target_hex[i:i+2], 16) for i in (1,3,5))
+            else:
+                target_rgb = (0,0,0)
+        except Exception:
+            target_rgb = (0,0,0)
+
+        tolerance = int(self.reaction_tolerance_var.get() or 0)
+        cooldown_ms = int(self.reaction_cooldown_var.get() or 200)
+        delay_ms = int(self.reaction_delay_var.get() or 0)
+
+        last_fire = 0
+        logger = logging.getLogger(__name__)
+        while getattr(self, '_reaction_running', False):
+            try:
+                # If Watch Cursor is enabled, sample the live cursor position; otherwise use configured X/Y
+                if getattr(self, 'reaction_watch_cursor_var', None) and self.reaction_watch_cursor_var.get():
+                    pos = _get_cursor_pos()
+                    if pos:
+                        x, y = pos
+                    else:
+                        # fallback to pynput Controller position
+                        try:
+                            x, y = mouse.position
+                        except Exception:
+                            x, y = int(self.reaction_x_var.get() or 0), int(self.reaction_y_var.get() or 0)
+                else:
+                    x = int(self.reaction_x_var.get() or 0)
+                    y = int(self.reaction_y_var.get() or 0)
+                col = _get_pixel_color(x, y)
+                if col is None:
+                    logger.debug("Reaction: GetPixel returned None at (%s,%s)", x, y)
+                    time.sleep(0.01)
+                    continue
+
+                dist = self._color_distance(col, target_rgb)
+                now = int(time.time()*1000)
+                logger.debug("Reaction sample at (%s,%s): sampled=%s target=%s tol=%s dist=%.2f last_fire=%s now=%s", x, y, col, target_rgb, tolerance, dist, last_fire, now)
+
+                fired = False
+                if dist <= tolerance:
+                    if now - last_fire >= cooldown_ms:
+                        # optional delay before click
+                        if delay_ms > 0:
+                            time.sleep(delay_ms/1000.0)
+                        try:
+                            # If configured, send a keyboard key instead of a mouse click
+                            use_kb = getattr(self, 'reaction_use_keyboard_var', None) and self.reaction_use_keyboard_var.get()
+                            kb_key = (self.reaction_key_var.get() or '').strip() if use_kb else ''
+                            if use_kb and kb_key:
+                                try:
+                                    from pynput.keyboard import Controller as KController, Key
+                                    kctl = KController()
+                                    if hasattr(Key, kb_key):
+                                        kctl.press(getattr(Key, kb_key))
+                                        kctl.release(getattr(Key, kb_key))
+                                    else:
+                                        kctl.press(kb_key)
+                                        kctl.release(kb_key)
+                                except Exception as e:
+                                    logger.exception("Reaction key press failed: %s", e)
+                            else:
+                                mouse.press(btn)
+                                mouse.release(btn)
+                            fired = True
+                        except Exception as e:
+                            logger.exception("Reaction click/keypress failed: %s", e)
+                        last_fire = int(time.time()*1000)
+                if fired:
+                    logger.info("Reaction fired click at (%s,%s) sampled=%s target=%s dist=%.2f", x, y, col, target_rgb, dist)
+                time.sleep(0.01)
+            except Exception as e:
+                logger.exception("Error in reaction loop: %s", e)
+                time.sleep(0.05)
+
+    def _bind_reaction_start_hotkey(self):
+        self.reaction_start_label.config(text='Listening...')
+        self.is_setting_hotkey = True
+        from pynput import keyboard
+        def on_press(key):
+            if not self.is_setting_hotkey:
+                return False
+            try:
+                key_name = ''
+                if hasattr(key, 'name'):
+                    key_name = key.name.lower()
+                elif hasattr(key, 'char'):
+                    key_name = key.char.lower() if key.char else ''
+                else:
+                    key_name = str(key).lower()
+                self.reaction_start_hotkey.set(key_name)
+                self.reaction_start_label.config(text=key_name)
+                self.is_setting_hotkey = False
+                # restart global listener so it picks up new hotkey
+                try:
+                    self._stop_hotkey_listener()
+                    self._start_hotkey_listener()
+                except Exception:
+                    pass
+                return False
+            except Exception:
+                return False
+        bind_listener = keyboard.Listener(on_press=on_press)
+        bind_listener.daemon = True
+        bind_listener.start()
+
+    def _bind_reaction_stop_hotkey(self):
+        self.reaction_stop_label.config(text='Listening...')
+        self.is_setting_hotkey = True
+        from pynput import keyboard
+        def on_press(key):
+            if not self.is_setting_hotkey:
+                return False
+            try:
+                key_name = ''
+                if hasattr(key, 'name'):
+                    key_name = key.name.lower()
+                elif hasattr(key, 'char'):
+                    key_name = key.char.lower() if key.char else ''
+                else:
+                    key_name = str(key).lower()
+                self.reaction_stop_hotkey.set(key_name)
+                self.reaction_stop_label.config(text=key_name)
+                self.is_setting_hotkey = False
+                try:
+                    self._stop_hotkey_listener()
+                    self._start_hotkey_listener()
+                except Exception:
+                    pass
+                return False
+            except Exception:
+                return False
+        bind_listener = keyboard.Listener(on_press=on_press)
+        bind_listener.daemon = True
+        bind_listener.start()
+
+    def _bind_autoclick_key(self):
+        """Bind a key to be sent when the autoclicker fires."""
+        try:
+            self.autoclick_key_label.config(text='Listening...')
+        except Exception:
+            pass
+        self.is_setting_hotkey = True
+        from pynput import keyboard
+        def on_press(key):
+            if not self.is_setting_hotkey:
+                return False
+            try:
+                key_name = ''
+                if hasattr(key, 'name'):
+                    key_name = key.name.lower()
+                elif hasattr(key, 'char'):
+                    key_name = key.char.lower() if key.char else ''
+                else:
+                    key_name = str(key).lower()
+                self.autoclick_key_var.set(key_name)
+                try:
+                    self.autoclick_key_label.config(text=key_name)
+                except Exception:
+                    pass
+                self.is_setting_hotkey = False
+                return False
+            except Exception:
+                return False
+        bind_listener = keyboard.Listener(on_press=on_press)
+        bind_listener.daemon = True
+        bind_listener.start()
+
+    def _bind_reaction_key(self):
+        """Bind a key to be sent when the reaction test fires."""
+        try:
+            self.reaction_key_label.config(text='Listening...')
+        except Exception:
+            pass
+        self.is_setting_hotkey = True
+        from pynput import keyboard
+        def on_press(key):
+            if not self.is_setting_hotkey:
+                return False
+            try:
+                key_name = ''
+                if hasattr(key, 'name'):
+                    key_name = key.name.lower()
+                elif hasattr(key, 'char'):
+                    key_name = key.char.lower() if key.char else ''
+                else:
+                    key_name = str(key).lower()
+                self.reaction_key_var.set(key_name)
+                try:
+                    self.reaction_key_label.config(text=key_name)
+                except Exception:
+                    pass
+                self.is_setting_hotkey = False
+                return False
+            except Exception:
+                return False
+        bind_listener = keyboard.Listener(on_press=on_press)
+        bind_listener.daemon = True
+        bind_listener.start()
 
     def _update_macro_loop(self):
         """Update the loop state for the selected macro."""
