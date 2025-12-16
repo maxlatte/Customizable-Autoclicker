@@ -1,1 +1,1 @@
-This is Windows 11 only, Sorry! Couldn
+This is Windows 11 only, Sorry! Couldn't get Linux to work :(
